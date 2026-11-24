@@ -31,7 +31,8 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from v9_colab_cpu_pack import ULTRA_POOLS, _download_tmp, _fetch_parquet_urls
+from v9_colab_cpu_pack import build_pool_shard
+from v9_colab_tpu_xla import detect_xla_runtime
 
 RELEASE_BASE = "https://github.com/anhthinhvup/genesis-v9-ultra-kit/releases/download/v0.9-base"
 
@@ -126,106 +127,62 @@ def run_rust_cpu_pack(pools_spec: str, ultra_dir: Path, kit_dir: Path) -> list[d
     out_dir = ultra_dir / "shards"
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path("/tmp/v9_pq_stream") if os.name != "nt" else (ultra_dir / "_tmp_pq")
-    reports: list[dict[str, Any]] = []
-
-    for item in pools_spec.split(","):
-        if not item.strip(): continue
-        pid, mtok_s = item.strip().split(":", 1)
-        pid = pid.strip()
-        target_toks = int(float(mtok_s) * 1_000_000)
-        spec = ULTRA_POOLS[pid]
-        out_bin = out_dir / f"{pid}.bin"
-        cur_toks = (out_bin.stat().st_size // 2) if out_bin.is_file() else 0
-        if cur_toks >= target_toks:
-            reports.append({"pool": pid, "status": "done", "tokens": cur_toks})
-            continue
-        urls = _fetch_parquet_urls(spec["repo"], spec["cfg"], max_files=80)
-        t0 = time.perf_counter()
-        leaks_tot = docs_tot = files_used = 0
-        for idx, url in enumerate(urls):
-            if cur_toks >= target_toks: break
-            pq_f = tmp_dir / f"{pid}_{idx:03d}.parquet"
-            try:
-                _download_tmp(url, pq_f)
-                tbl = pq.read_table(pq_f, columns=[spec["col"]])
-                texts = tbl[spec["col"]].to_pylist()
-            finally:
-                pq_f.unlink(missing_ok=True)
-            files_used += 1
-            rem = target_toks - cur_toks
-            assert rs_bin is not None, "Rust v9_stream_bin_rs required for ultra speed"
-            proc = subprocess.Popen(
-                [str(rs_bin), str(tok_p), str(guard_p) if guard_p.is_file() else "none", str(out_bin), str(rem)],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
-            assert proc.stdin is not None
-            min_c, max_c = spec["min_chars"], spec["max_chars"]
-            for tx in texts:
-                if not tx: continue
-                s = str(tx)[:max_c].strip()
-                if len(s) < min_c: continue
-                b = s.encode("utf-8", errors="ignore")
-                proc.stdin.write(struct.pack("<I", len(b)))
-                proc.stdin.write(b)
-            proc.stdin.close()
-            out_s = proc.stdout.read().decode("utf-8", errors="replace").strip() if proc.stdout else ""
-            err_s = proc.stderr.read().decode("utf-8", errors="replace").strip() if proc.stderr else ""
-            rc = proc.wait()
-            if rc != 0:
-                raise RuntimeError(f"v9_stream_bin_rs failed ({rc}): {err_s}")
-            st = json.loads(out_s.splitlines()[-1]) if out_s else {}
-            cur_toks = out_bin.stat().st_size // 2
-            leaks_tot += int(st.get("leaks_blocked", 0))
-            docs_tot += int(st.get("docs_kept", 0))
-            print(f"[RUST-PACK] {pid} #{files_used} Mtok={cur_toks/1e6:.1f}/{target_toks/1e6:.1f} "
-                  f"rust={st.get('tok_per_sec', 0)/1e6:.2f}M tok/s leaks={leaks_tot}", flush=True)
-        reports.append({"pool": pid, "tokens": cur_toks, "docs": docs_tot, "leaks": leaks_tot, "sec": round(time.perf_counter() - t0, 1)})
+    workers = max(2, (os.cpu_count() or 4) - 1)
+    reports = [
+        build_pool_shard(
+            pid.strip(), int(float(mtok_s) * 1_000_000), out_dir, tok_p,
+            guard_p if guard_p.is_file() else None, tmp_dir, workers, rust_bin=rs_bin,
+        )
+        for item in pools_spec.split(",") if item.strip()
+        for pid, mtok_s in [item.strip().split(":", 1)]
+    ]
     (out_dir / "rust_pack_manifest.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
     return reports
 
 
-def _run_phase(kit_dir: Path, args_list: list[str], name: str) -> Path:
-    print(f"\n========== LAUNCHING {name} ==========", flush=True)
-    cmd = [sys.executable, "-u", str(kit_dir / "v9_colab_ultra_1000cu.py"), *args_list]
+def _run_phase(kit_dir: Path, args_list: list[str], name: str, use_xla: bool = False) -> Path:
+    print(f"\n========== LAUNCHING {name} ({'TPU-XLA' if use_xla else 'CUDA-ULTRA'}) ==========", flush=True)
+    script = kit_dir / ("v9_colab_tpu_xla.py" if use_xla else "v9_colab_ultra_1000cu.py")
+    extra = ["--mode", "train"] if use_xla else ["--auto-profile"]
+    cmd = [sys.executable, "-u", str(script), *extra, *args_list]
     subprocess.run(cmd, check=True)
     out_idx = args_list.index("--out-dir") + 1
     return Path(args_list[out_idx]) / "genesis_v9_1_5b_ultra_inference_bf16.pt"
 
 
 def run_train_all(ultra_dir: Path, kit_dir: Path, bs: int, ga: int, cu_rate: float) -> None:
+    xla_info = detect_xla_runtime()
+    use_xla = bool(getattr(xla_info, "is_xla", False))
+    if use_xla:
+        bs, ga = min(bs, 8), max(ga, 8)
+        if cu_rate <= 0.0 or cu_rate == 8.8:
+            cu_rate = 3.2
     tok = str(kit_dir / "v9_tok_16k.json")
     sh_dir, sota_dir, ck_dir = ultra_dir / "shards", ultra_dir / "sota_v2", ultra_dir / "ckpts"
     base_wt = ultra_dir / "genesis_v9_1_5b_engram196b_deep_bf16.pt"
     val_sh = str(sota_dir / "val.bin")
 
-    # Build dynamic mix from whichever pretrain shards exist on Drive
     cand = [("fineweb_edu.bin", 0.40), ("cosmopedia_v2.bin", 0.20), ("finemath_4plus.bin", 0.15), ("vi_fineweb2.bin", 0.15), ("python_code.bin", 0.10)]
-    p1_mix = ",".join(f"{sh_dir / n}:{w}" for n, w in cand if (sh_dir / n).is_file())
-    if not p1_mix:
-        p1_mix = f"{sota_dir / 'train.bin'}:1.0"
-
-    # Phase 1: High-Density Pretrain (550 CU, seq=1024, R=1 -> R=2)
+    p1_mix = ",".join(f"{sh_dir / n}:{w}" for n, w in cand if (sh_dir / n).is_file()) or f"{sota_dir / 'train.bin'}:1.0"
     p1_out = _run_phase(kit_dir, [
         "--preset", "v9_1_5b_b200", "--data-dir", str(sh_dir), "--mix-spec", p1_mix, "--val-shard", val_sh,
         "--out-dir", str(ck_dir / "p1_pretrain"), "--init-from", str(base_wt), "--tokenizer", tok,
         "--steps", "160000", "--batch-size", str(bs), "--seq-len", "1024", "--grad-accum", str(ga),
         "--lr", "6e-4", "--lr-min", "8e-5", "--recur-steps", "2", "--r1-warmup-frac", "0.60",
         "--save-every-mins", "25", "--eval-every", "400", "--max-cu", "550.0", "--cu-rate", str(cu_rate),
-    ], "PHASE 1: HIGH-DENSITY PRETRAIN (550 CU)")
+    ], "PHASE 1: HIGH-DENSITY PRETRAIN (550 CU)", use_xla=use_xla)
 
-    # Phase 2: Mid-Training & Context Extension 2048 (220 CU, R=2)
     p2_cand = [(sh_dir / "finemath_4plus.bin", 0.30), (sh_dir / "cosmopedia_v2.bin", 0.25), (sh_dir / "vi_fineweb2.bin", 0.20), (sota_dir / "train.bin", 0.25)]
     p2_mix = ",".join(f"{p}:{w}" for p, w in p2_cand if p.is_file())
-    p2_bs = max(2, bs // 2)
+    p2_bs = max(2, min(4, bs // 2)) if use_xla else max(2, bs // 2)
     p2_out = _run_phase(kit_dir, [
         "--preset", "v9_1_5b_b200", "--data-dir", str(sh_dir), "--mix-spec", p2_mix, "--val-shard", val_sh,
         "--out-dir", str(ck_dir / "p2_midtrain_2048"), "--init-from", str(p1_out), "--tokenizer", tok,
         "--steps", "60000", "--batch-size", str(p2_bs), "--seq-len", "2048", "--grad-accum", str(ga * 2),
         "--lr", "2e-4", "--lr-min", "3e-5", "--recur-steps", "2", "--r1-warmup-frac", "0.0",
         "--save-every-mins", "25", "--eval-every", "300", "--max-cu", "220.0", "--cu-rate", str(cu_rate),
-    ], "PHASE 2: MID-TRAINING 2048 (220 CU)")
+    ], "PHASE 2: MID-TRAINING 2048 (220 CU)", use_xla=use_xla)
 
-    # Phase 3A: SOTA v2 Mix-Distillation Stage 1A (70 CU, seq=1024, <BOT> masked)
     p3a_out = _run_phase(kit_dir, [
         "--preset", "v9_1_5b_b200", "--data-dir", str(sota_dir),
         "--mix-spec", f"{sota_dir / 'sota_v2_stage1a_1024.bin'}:0.85,{sota_dir / 'sota_v2_non_think_chat.bin'}:0.15",
@@ -233,9 +190,8 @@ def run_train_all(ultra_dir: Path, kit_dir: Path, bs: int, ga: int, cu_rate: flo
         "--tokenizer", tok, "--steps", "2000", "--batch-size", str(bs), "--seq-len", "1024", "--grad-accum", str(ga),
         "--lr", "8e-5", "--lr-min", "1e-5", "--recur-steps", "2", "--sft-mask-bot",
         "--save-every-mins", "20", "--eval-every", "100", "--max-cu", "70.0", "--cu-rate", str(cu_rate),
-    ], "PHASE 3A: SOTA V2 STAGE 1A (70 CU)")
+    ], "PHASE 3A: SOTA V2 STAGE 1A (70 CU)", use_xla=use_xla)
 
-    # Phase 3B: SOTA v2 Long-CoT + OPD Anneal (40 CU, seq=2048, <BOT> masked)
     _run_phase(kit_dir, [
         "--preset", "v9_1_5b_b200", "--data-dir", str(sota_dir),
         "--mix-spec", f"{sota_dir / 'sota_v2_stage1b_2048.bin'}:0.65,{sota_dir / 'sota_v2_non_think_chat.bin'}:0.25,{sota_dir / 'opd_train.bin'}:0.10",
@@ -243,7 +199,7 @@ def run_train_all(ultra_dir: Path, kit_dir: Path, bs: int, ga: int, cu_rate: flo
         "--tokenizer", tok, "--steps", "600", "--batch-size", str(p2_bs), "--seq-len", "2048", "--grad-accum", str(ga * 2),
         "--lr", "3e-5", "--lr-min", "5e-6", "--decay-ratio", "0.50", "--recur-steps", "2", "--sft-mask-bot",
         "--save-every-mins", "15", "--eval-every", "50", "--max-cu", "40.0", "--cu-rate", str(cu_rate),
-    ], "PHASE 3B: SOTA V2 LONG-COT + OPD FINAL (40 CU)")
+    ], "PHASE 3B: SOTA V2 LONG-COT + OPD FINAL (40 CU)", use_xla=use_xla)
 
 
 def main() -> None:

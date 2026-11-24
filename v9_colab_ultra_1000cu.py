@@ -28,10 +28,13 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from genesis_v9_v41 import DEFAULT_V9_TOK_PATH, GenesisV9V41Native, compute_v9_v41_loss, load_v9_canon_lut_from_tokenizer
-from muon_hybrid_opt import MuonHybridOptimizer
 from v9_b200_core import B200_PRESETS
 from v9_b200_fast_kernels import apply_fast_b200_kernels
 from v9_data_efficiency import WSDScheduler
+from v9_ultra_speed_accel import (
+    AsyncMixPrefetcher, ZeroSyncLossAccumulator, build_fast_optimizer,
+    compile_v9_fast, compute_v9_v41_loss_nosync, recommend_gpu_profile,
+)
 
 TOK_EOS, TOK_USER, TOK_BOT = 2, 3, 4
 
@@ -216,12 +219,24 @@ def run_ultra_training(args: argparse.Namespace) -> dict[str, Any]:
         torch.set_float32_matmul_precision("high")
 
     dev_label, est_cu = estimate_ultra_cu_rate(device)
+    vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1e9) if use_amp else 0.0
+    prof = recommend_gpu_profile(dev_label, vram_gb) if use_amp else None
+    bs, sl, ga = args.batch_size, args.seq_len, max(1, args.grad_accum)
+    delta_chunk, compile_mode = 16, "default"
+    if prof is not None:
+        delta_chunk, compile_mode = prof.delta_chunk, prof.compile_mode
+        if args.auto_profile:
+            bs, ga = prof.batch_size, prof.grad_accum
+            if sl >= 2048:
+                bs, ga = max(2, bs // 2), ga * 2
     cu_rate = args.cu_rate if args.cu_rate > 0.0 else est_cu
     shards = parse_mix_spec(args.mix_spec, args.data_dir)
     val_p = args.val_shard if (args.val_shard and args.val_shard.is_file()) else (args.data_dir / "val.bin")
     val_mm = np.memmap(val_p, dtype="<u2", mode="r") if val_p.is_file() else shards[0][1]
 
     cfg = B200_PRESETS[args.preset]
+    if prof is None:
+        delta_chunk = cfg.delta_chunk
     model = GenesisV9V41Native(cfg, fsp_horizon=16, include_train_heads=True).to(device)
     tok_used = ""
     if cfg.vocab == 16384:
@@ -230,10 +245,10 @@ def run_ultra_training(args: argparse.Namespace) -> dict[str, Any]:
                 model.set_canonical_lut(load_v9_canon_lut_from_tokenizer(tp, cfg.vocab))
                 tok_used = str(tp)
                 break
-    kcounts = apply_fast_b200_kernels(model, delta_chunk=cfg.delta_chunk) if use_amp else {"cpu_ref": 1}
+    kcounts = apply_fast_b200_kernels(model, delta_chunk=delta_chunk) if use_amp else {"cpu_ref": 1}
 
     init_info: dict[str, Any] = {}
-    opt = MuonHybridOptimizer(model, lr=args.lr, weight_decay=args.weight_decay, sparse_lr_mult=1.5, muon_on_bitlinear=False)
+    opt = build_fast_optimizer(model, lr=args.lr, weight_decay=args.weight_decay, sparse_lr_mult=1.5)
     start_step = cum_tokens = 0
     best_val, cu_prior = float("inf"), 0.0
     latest_ckpt = out_dir / "latest_ckpt.pt"
@@ -256,15 +271,11 @@ def run_ultra_training(args: argparse.Namespace) -> dict[str, Any]:
     wsd = WSDScheduler(max(1, total_steps), lr_max=args.lr,
                        warmup_steps=max(1, min(200, max(2, total_steps // 20))),
                        decay_ratio=args.decay_ratio, min_lr_ratio=min_lr_ratio)
-    compiled_ok, train_mod = False, model
-    if use_amp and not args.no_compile and hasattr(torch, "compile"):
-        try:
-            train_mod, compiled_ok = torch.compile(model), True
-        except Exception:
-            train_mod = model
+    if use_amp and not args.no_compile:
+        train_mod, compiled_ok = compile_v9_fast(model, mode=compile_mode, allow_cudagraphs=False)
+    else:
+        train_mod, compiled_ok = model, False
 
-    rng = np.random.default_rng(args.seed + start_step * 9973)
-    bs, sl, ga = args.batch_size, args.seq_len, max(1, args.grad_accum)
     toks_per_step = bs * sl * ga
     r1_until = int(total_steps * max(0.0, min(1.0, args.r1_warmup_frac)))
     eval_every = args.eval_every if args.eval_every > 0 else max(1, min(200, max(5, total_steps // 10)))
@@ -274,60 +285,63 @@ def run_ultra_training(args: argparse.Namespace) -> dict[str, Any]:
     log_path, t0 = out_dir / "train_telemetry.jsonl", time.perf_counter()
     last_save_t, cu_used, final_step, stopped_cu = t0, cu_prior, start_step, False
     print(json.dumps({"event": "start", "device": dev_label, "cu_rate": cu_rate, "compiled": compiled_ok,
-                      "kernels": kcounts, "init": init_info, "shards": [(n, int(m.size), round(w, 3)) for n, m, w in shards],
+                      "bs": bs, "ga": ga, "sl": sl, "delta_chunk": delta_chunk, "kernels": kcounts, "init": init_info,
+                      "shards": [(n, int(m.size), round(w, 3)) for n, m, w in shards],
                       "val_before": round(val_before, 4), "r1_until_step": r1_until}, ensure_ascii=False), flush=True)
 
     model.train()
-    for step in range(start_step + 1, total_steps + 1):
-        st_t0 = time.perf_counter()
-        r_now = 1 if (step <= r1_until and args.recur_steps > 1) else args.recur_steps
-        phase, cur_lr = wsd.phase_at(step), wsd.step_optimizer(opt, step)
-        opt.zero_grad(set_to_none=True)
-        acc = {"total_loss": 0.0, "final_ce": 0.0, "mtp_loss": 0.0, "fsp_loss": 0.0}
-        for _ in range(ga):
-            bt = sample_mix_batch(shards, bs, sl, rng, cfg.vocab).to(device, non_blocking=use_amp)
-            inp, tgt = bt[:, :-1], bt[:, 1:]
-            tmask = build_bot_sft_mask(inp, tgt) if args.sft_mask_bot else None
-            with amp_ctx:
-                out = train_mod(inp, recur_steps=r_now, targets=tgt, return_details=True)
-                loss, lstats = compute_v9_v41_loss(model, out, tgt, token_mask=tmask)
-                (loss / float(ga)).backward()
-            for k in acc:
-                acc[k] += lstats[k] / ga
-        gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0))
-        opt.step()
+    loss_acc = ZeroSyncLossAccumulator(device=device)
+    with AsyncMixPrefetcher(shards, bs, sl, cfg.vocab, device=device, seed=args.seed + start_step * 9973,
+                            sft_mask_bot=args.sft_mask_bot, queue_size=4) as prefetcher:
+        for step in range(start_step + 1, total_steps + 1):
+            st_t0 = time.perf_counter()
+            r_now = 1 if (step <= r1_until and args.recur_steps > 1) else args.recur_steps
+            phase, cur_lr = wsd.phase_at(step), wsd.step_optimizer(opt, step)
+            opt.zero_grad(set_to_none=True)
+            loss_acc.reset()
+            for _ in range(ga):
+                inp, tgt, tmask = prefetcher.next_batch()
+                with amp_ctx:
+                    out = train_mod(inp, recur_steps=r_now, targets=tgt, return_details=True)
+                    loss, lstats = compute_v9_v41_loss_nosync(model, out, tgt, token_mask=tmask)
+                    (loss / float(ga)).backward()
+                loss_acc.update(lstats)
+            gnorm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=True)
+            opt.step()
+            metrics = loss_acc.finalize(grad_norm=gnorm_t)
+            gnorm = float(metrics.pop("gnorm", 0.0))
 
-        cum_tokens += toks_per_step
-        final_step = step
-        elapsed_s = time.perf_counter() - t0
-        cu_used = cu_prior + (elapsed_s / 3600.0) * cu_rate
-        tok_s = toks_per_step / max(1e-6, time.perf_counter() - st_t0)
-        need_eval = (step % eval_every == 0) or (step == total_steps)
-        if need_eval:
-            last_val = evaluate_val_ce(model, val_mm, min(bs, 4), sl, 2, device, use_amp, args.recur_steps)
-        rec = {
-            "ts": int(time.time()), "step": step, "r": r_now, "phase": phase, "lr": round(cur_lr, 7),
-            **{k: round(v, 4) for k, v in acc.items()}, "gnorm": round(gnorm, 3), "val_ce": round(last_val, 4),
-            "tok_s": round(tok_s, 1), "cum_tokens": cum_tokens, "cu_used": round(cu_used, 3),
-        }
-        with log_path.open("a", encoding="utf-8") as lf:
-            lf.write(json.dumps(rec) + "\n")
-        if step == start_step + 1 or need_eval or step % max(1, total_steps // 20) == 0:
-            print(f"[v9-ultra] step={step}/{total_steps} R={r_now} ({phase}) lr={cur_lr:.2e} "
-                  f"ce={acc['final_ce']:.4f} val={last_val:.4f} tok/s={tok_s:.0f} Mtok={cum_tokens/1e6:.1f} cu={cu_used:.2f}/{args.max_cu:.1f}", flush=True)
+            cum_tokens += toks_per_step
+            final_step = step
+            elapsed_s = time.perf_counter() - t0
+            cu_used = cu_prior + (elapsed_s / 3600.0) * cu_rate
+            tok_s = toks_per_step / max(1e-6, time.perf_counter() - st_t0)
+            need_eval = (step % eval_every == 0) or (step == total_steps)
+            if need_eval:
+                last_val = evaluate_val_ce(model, val_mm, min(bs, 4), sl, 2, device, use_amp, args.recur_steps)
+            rec = {
+                "ts": int(time.time()), "step": step, "r": r_now, "phase": phase, "lr": round(cur_lr, 7),
+                **{k: round(float(v), 4) for k, v in metrics.items()}, "gnorm": round(gnorm, 3),
+                "val_ce": round(last_val, 4), "tok_s": round(tok_s, 1), "cum_tokens": cum_tokens, "cu_used": round(cu_used, 3),
+            }
+            with log_path.open("a", encoding="utf-8") as lf:
+                lf.write(json.dumps(rec) + "\n")
+            if step == start_step + 1 or need_eval or step % max(1, total_steps // 20) == 0:
+                print(f"[v9-ultra] step={step}/{total_steps} R={r_now} ({phase}) lr={cur_lr:.2e} "
+                      f"ce={metrics['final_ce']:.4f} val={last_val:.4f} tok/s={tok_s:.0f} Mtok={cum_tokens/1e6:.1f} cu={cu_used:.2f}/{args.max_cu:.1f}", flush=True)
 
-        hit_cu = cu_rate > 0.0 and cu_used >= args.max_cu
-        need_save = (time.perf_counter() - last_save_t) >= max(0.05, args.save_every_mins) * 60.0
-        meta = {"preset": args.preset, "step": step, "cum_tokens": cum_tokens, "best_val": min(best_val, last_val), "cu_used": cu_used}
-        if need_eval and last_val < best_val:
-            best_val = last_val
-            save_ckpt_atomic(out_dir / "best_weights_bf16.pt", model, opt, meta, save_opt=False)
-        if need_save or step == total_steps or hit_cu:
-            save_ckpt_atomic(latest_ckpt, model, opt, meta, save_opt=True)
-            last_save_t = time.perf_counter()
-        if hit_cu:
-            stopped_cu = True
-            break
+            hit_cu = cu_rate > 0.0 and cu_used >= args.max_cu
+            need_save = (time.perf_counter() - last_save_t) >= max(0.05, args.save_every_mins) * 60.0
+            meta = {"preset": args.preset, "step": step, "cum_tokens": cum_tokens, "best_val": min(best_val, last_val), "cu_used": cu_used}
+            if need_eval and last_val < best_val:
+                best_val = last_val
+                save_ckpt_atomic(out_dir / "best_weights_bf16.pt", model, opt, meta, save_opt=False)
+            if need_save or step == total_steps or hit_cu:
+                save_ckpt_atomic(latest_ckpt, model, opt, meta, save_opt=True)
+                last_save_t = time.perf_counter()
+            if hit_cu:
+                stopped_cu = True
+                break
 
     val_after = evaluate_val_ce(model, val_mm, min(bs, 4), sl, 2, device, use_amp, args.recur_steps)
     exp_meta = {} if args.no_export else export_inference_bf16(
@@ -370,6 +384,7 @@ def main() -> None:
     ap.add_argument("--cu-rate", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=20261124)
     ap.add_argument("--no-compile", action="store_true")
+    ap.add_argument("--auto-profile", action="store_true", help="Auto-pick optimal bs/ga/delta_chunk for G4/H100/A100")
     ap.add_argument("--no-resume", action="store_true")
     ap.add_argument("--no-export", action="store_true")
     print(json.dumps(run_ultra_training(ap.parse_args()), indent=2, ensure_ascii=False))
