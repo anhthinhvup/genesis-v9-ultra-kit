@@ -52,7 +52,7 @@ def _sync(backend: str) -> None:
 
 def bench_one_config(
     preset: str, batch_size: int, seq_len: int, recur_steps: int,
-    warmup: int, iters: int, use_compile: bool, cu_rate: float,
+    warmup: int, iters: int, grad_accum: int, use_compile: bool, cu_rate: float,
 ) -> dict[str, Any]:
     backend, dev, hw = _detect_backend()
     if backend == "cuda":
@@ -96,21 +96,23 @@ def bench_one_config(
         _sync(backend)
     warmup_s = time.perf_counter() - t_compile0
 
+    ga = max(1, int(grad_accum))
     t0 = time.perf_counter()
     last_loss = 0.0
     for _ in range(iters):
         opt.zero_grad(set_to_none=True)
-        with amp_ctx:
-            out = train_mod(x[:, :-1], recur_steps=recur_steps, targets=x[:, 1:], return_details=True)
-            loss, _ = compute_v9_v41_loss(model, out, x[:, 1:])
-        loss.backward()
+        for _ in range(ga):
+            with amp_ctx:
+                out = train_mod(x[:, :-1], recur_steps=recur_steps, targets=x[:, 1:], return_details=True)
+                loss, _ = compute_v9_v41_loss(model, out, x[:, 1:])
+            (loss / float(ga)).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         _sync(backend)
         last_loss = float(loss.detach().item())
     dt = max(1e-6, time.perf_counter() - t0)
 
-    toks = batch_size * seq_len * iters
+    toks = batch_size * seq_len * ga * iters
     tok_s = toks / dt
     tok_hr = tok_s * 3600.0
     peak_gb = round(torch.cuda.max_memory_allocated() / 1e9, 2) if backend == "cuda" else 0.0
@@ -139,8 +141,9 @@ def main() -> None:
     ap.add_argument("--batch-sizes", default="4,8,12")
     ap.add_argument("--recurs", default="1,2")
     ap.add_argument("--seq-len", type=int, default=1024)
-    ap.add_argument("--warmup", type=int, default=3)
-    ap.add_argument("--iters", type=int, default=8)
+    ap.add_argument("--warmup", type=int, default=2)
+    ap.add_argument("--iters", type=int, default=4)
+    ap.add_argument("--grad-accum", type=int, default=4)
     ap.add_argument("--cu-rate", type=float, default=0.0)
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--out-json", type=Path, default=None)
@@ -152,7 +155,7 @@ def main() -> None:
     for r in recs:
         for bs in bss:
             try:
-                rep = bench_one_config(a.preset, bs, a.seq_len, r, a.warmup, a.iters, not a.no_compile, a.cu_rate)
+                rep = bench_one_config(a.preset, bs, a.seq_len, r, a.warmup, a.iters, a.grad_accum, not a.no_compile, a.cu_rate)
             except Exception as exc:
                 rep = {"ok": False, "bs": bs, "seq_len": a.seq_len, "recur_steps": r, "error": f"{type(exc).__name__}: {exc}"}
                 gc.collect()
