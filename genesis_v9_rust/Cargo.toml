@@ -1,0 +1,25 @@
+[package]
+name = "genesis_v9"
+version = "0.9.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Zero-dependency Pure-Rust AVX2+FMA+TL2 Genesis-v9 1.5B CPU Inference Engine, val.bin Evaluator & v9_tok_16k Shard Packer."
+
+[lib]
+name = "genesis_v9"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "v9_packer_rs"
+path = "src/bin/v9_packer_rs.rs"
+
+[[bin]]
+name = "genesis_v9_cli"
+path = "src/bin/genesis_v9_cli.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
