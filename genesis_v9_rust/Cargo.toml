@@ -18,6 +18,10 @@ path = "src/bin/v9_packer_rs.rs"
 name = "genesis_v9_cli"
 path = "src/bin/genesis_v9_cli.rs"
 
+[[bin]]
+name = "v9_stream_bin_rs"
+path = "src/bin/v9_stream_bin_rs.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
